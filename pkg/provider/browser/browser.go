@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -22,7 +23,9 @@ const DEFAULT_TIMEOUT float64 = 300000
 type Client struct {
 	BrowserType           string
 	BrowserExecutablePath string
-	Headless              bool
+	// Persistent browser profile directory, enables extensions and passkeys when set
+	BrowserUserDataDir string
+	Headless           bool
 	// Setup alternative directory to download playwright browsers to
 	BrowserDriverDir string
 	Timeout          int
@@ -36,6 +39,7 @@ func New(idpAccount *cfg.IDPAccount) (*Client, error) {
 		BrowserDriverDir:      idpAccount.BrowserDriverDir,
 		BrowserType:           strings.ToLower(idpAccount.BrowserType),
 		BrowserExecutablePath: idpAccount.BrowserExecutablePath,
+		BrowserUserDataDir:    idpAccount.BrowserUserDataDir,
 		Timeout:               idpAccount.Timeout,
 		BrowserAutoFill:       idpAccount.BrowserAutoFill,
 	}, nil
@@ -102,6 +106,10 @@ func (cl *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		launchOptions.ExecutablePath = &cl.BrowserExecutablePath
 	}
 
+	if cl.BrowserUserDataDir != "" {
+		return cl.authenticateWithUserDataDir(pw, browserType, launchOptions, loginDetails)
+	}
+
 	// currently using the main browsers supported by Playwright: Chromium, Firefox or Webkit
 	//
 	// this is a sandboxed browser window so password managers and addons are separate
@@ -153,6 +161,80 @@ func (cl *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 	}()
 
 	return getSAMLResponse(page, loginDetails, cl)
+}
+
+// persistentIgnoredDefaultArgs are Playwright default Chromium args that block passkeys
+// (platform authenticators) and password manager extensions such as 1Password
+var persistentIgnoredDefaultArgs = []string{
+	"--enable-automation",
+	"--disable-extensions",
+	"--disable-component-extensions-with-background-pages",
+	"--disable-default-apps",
+	"--password-store=basic",
+	"--use-mock-keychain",
+}
+
+// authenticateWithUserDataDir launches the browser with a persistent profile, so that
+// extensions, passkeys and sessions are kept between logins
+func (cl *Client) authenticateWithUserDataDir(pw *playwright.Playwright, browserType playwright.BrowserType, launchOptions playwright.BrowserTypeLaunchOptions, loginDetails *creds.LoginDetails) (string, error) {
+	userDataDir, err := expandHomeDir(cl.BrowserUserDataDir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(userDataDir, 0700); err != nil {
+		return "", err
+	}
+	logger.Info(fmt.Sprintf("Using browser user data dir: %s", userDataDir))
+
+	persistentOptions := playwright.BrowserTypeLaunchPersistentContextOptions{
+		Headless:       launchOptions.Headless,
+		Channel:        launchOptions.Channel,
+		ExecutablePath: launchOptions.ExecutablePath,
+	}
+	if browserType.Name() == "chromium" {
+		persistentOptions.IgnoreDefaultArgs = persistentIgnoredDefaultArgs
+		// Playwright passes --no-sandbox by default, keep the sandbox for a profile with extensions
+		persistentOptions.ChromiumSandbox = playwright.Bool(true)
+	}
+
+	context, err := browserType.LaunchPersistentContext(userDataDir, persistentOptions)
+	if err != nil {
+		return "", fmt.Errorf("failed to launch browser with user data dir %s: %w", userDataDir, err)
+	}
+
+	defer func() {
+		logger.Info("clean up browser")
+		if err := context.Close(); err != nil {
+			logger.Info("Error when closing context", err)
+		}
+		if err := pw.Stop(); err != nil {
+			logger.Info("Error when stopping pm", err)
+		}
+	}()
+
+	// a persistent context opens with an initial blank page, reuse it
+	var page playwright.Page
+	if pages := context.Pages(); len(pages) > 0 {
+		page = pages[0]
+	} else {
+		page, err = context.NewPage()
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return getSAMLResponse(page, loginDetails, cl)
+}
+
+func expandHomeDir(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	userHomeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(userHomeDir, strings.TrimPrefix(path, "~")), nil
 }
 
 var getSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDetails, client *Client) (string, error) {
